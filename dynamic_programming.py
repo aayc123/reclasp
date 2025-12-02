@@ -47,16 +47,28 @@ class DynamicLayerOptimizer:
                 ], dim=0)
                 
                 target_norm = F.normalize(last_hidden_states[i].unsqueeze(0), dim=-1)
-                sigma = torch.matmul(F_cat, target_norm.T).squeeze()
-                
+                #sigma = torch.matmul(F_cat, target_norm.T).squeeze()
+                sigma = (F_cat * target_norm).sum(dim=-1).squeeze()
+                # 插入调试代码：
+                # print(f"DEBUG: Layer i={i}, Max skips M={M}, Current l={l}")
+                # print(f"DEBUG: sigma shape: {sigma.shape}, numel: {sigma.numel()}")
+                sigma_no_skip = sigma[:l] # 对应 F_cat 的上半部分 (No Skip)
+                sigma_skip = sigma[l:]    # 对应 F_cat 的下半部分 (Skip)
+                # print(f"DEBUG: sigma[:l] (No Skip) shape: {sigma_no_skip.shape}, numel: {sigma_no_skip.numel()}")
+                # print(f"DEBUG: sigma[l:] (Skip) shape: {sigma_skip.shape}, numel: {sigma_skip.numel()}")
+                if sigma_no_skip.numel() == 0 or sigma_skip.numel() == 0:
+                    print(f"CRITICAL ALERT: Empty tensor detected! i={i}, l={l}")
                 # 决策：跳过还是不跳过
-                if sigma[:l].max() > sigma[l:].max():
+                # 添加防御性检查：如果切片为空，则最大值设为负无穷大
+                max_no_skip = sigma_no_skip.max() if sigma_no_skip.numel() > 0 else -float('inf')
+                max_skip = sigma_skip.max() if sigma_skip.numel() > 0 else -float('inf')
+
+                if max_no_skip > max_skip:
                     g[i, 1:l + 1] = G
                     decisions[i, 1:l + 1] = False  # 不跳过
                 else:
                     g[i, 1:l + 1] = g[i - 1, :l]
                     decisions[i, 1:l + 1] = True  # 跳过
-            
             if i <= M:
                 g[i, i] = g[i - 1, i - 1]
                 decisions[i, i] = True
@@ -71,6 +83,8 @@ class DynamicLayerOptimizer:
         
         # 这里需要根据实际情况调整
         with torch.no_grad():
+            target_dtype = layer.input_layernorm.weight.dtype 
+            hidden_states = hidden_states.to(target_dtype)
             output = layer(hidden_states.unsqueeze(0))
             return output[0].squeeze(0)
     

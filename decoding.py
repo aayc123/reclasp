@@ -109,7 +109,12 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                 for draft_step in range(max_step_draft):
                     # 1. 计算缓存长度 (cache_len) 作为当前 token 的起始位置
                     # 确保 draft_past_key_values 不为 None
-                    cache_len = draft_past_key_values[0][0].shape[2] if draft_past_key_values is not None else 0
+                    if draft_past_key_values is not None and draft_past_key_values[0] is not None:
+                        # 进一步检查 KV 缓存张量是否为 None
+                        k_cache = draft_past_key_values[0][0] # k_cache 是第一个 Transformer 层的 Key cache 张量
+                        cache_len = k_cache.shape[2] if k_cache is not None else 0
+                    else:
+                        cache_len = 0
                     
                     # 2. 计算 position_ids：对于单个 token，其位置是 cache_len
                     # 确保 position_ids 是一个张量 (1, 1)

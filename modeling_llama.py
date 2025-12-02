@@ -141,7 +141,23 @@ class LlamaAttention(_LlamaAttention):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, kv_seq_len)
+        if position_ids is None:
+            # 这是一个关键步骤：如果 position_ids 为空，则根据 kv_seq_len 生成它
+            # 对于非增量解码，它应该是 [0, 1, 2, ..., kv_seq_len-1]
+            if past_key_value is None:
+                position_ids = torch.arange(
+                    0, kv_seq_len, dtype=torch.long, device=query_states.device
+                ).unsqueeze(0)
+            # 对于增量解码，它应该只有当前步的索引
+            else:
+                # 假设 position_ids 应该等于 (kv_seq_len - 1)，即上一次的长度
+                position_ids = torch.tensor(
+                    [kv_seq_len - 1], dtype=torch.long, device=query_states.device
+                ).unsqueeze(0)
+        
+        # 将 position_ids (张量) 传入
+        # 如果 self.rotary_emb 的 forward 签名是 (x, position_ids)
+        cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
