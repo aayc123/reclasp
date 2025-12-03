@@ -64,48 +64,29 @@ print('(Re-)Loading modeling...')
 class LlamaAttention(_LlamaAttention):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         # 先尝试调用父类初始化
-        try:
-            super().__init__(config, layer_idx=layer_idx)
-        except:
-            # 如果失败，手动初始化
-            nn.Module.__init__(self)
-            self.config = config
-            self.layer_idx = layer_idx
-            
-            # 确保所有必要的属性都存在（兼容新旧版本）
-        if not hasattr(self, 'config'):
-            self.config = config
-        if not hasattr(self, 'layer_idx'):
-            self.layer_idx = layer_idx
-        if not hasattr(self, 'hidden_size'):
-            self.hidden_size = config.hidden_size
+        super().__init__(config, layer_idx=layer_idx)
         if not hasattr(self, 'num_heads'):
             self.num_heads = config.num_attention_heads
-        if not hasattr(self, 'head_dim'):
-            self.head_dim = self.hidden_size // self.num_heads
         if not hasattr(self, 'num_key_value_heads'):
             self.num_key_value_heads = config.num_key_value_heads
         if not hasattr(self, 'num_key_value_groups'):
             self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        if not hasattr(self, 'max_position_embeddings'):
-            self.max_position_embeddings = config.max_position_embeddings
-        if not hasattr(self, 'rope_theta'):
-            self.rope_theta = getattr(config, 'rope_theta', 10000.0)
-        
-        # 确保投影层存在
-        if not hasattr(self, 'q_proj'):
-            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        if not hasattr(self, 'k_proj'):
-            self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        if not hasattr(self, 'v_proj'):
-            self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        if not hasattr(self, 'o_proj'):
-            self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        
-        # 确保 rotary_emb 被初始化（无论父类初始化是否成功）
+        if not hasattr(self, 'head_dim'):
+            self.head_dim = getattr(self, 'hidden_size', config.hidden_size) // self.num_heads
+        if not hasattr(self, 'hidden_size'):
+            self.hidden_size = config.hidden_size
+            
         if not hasattr(self, 'rotary_emb'):
-            self._init_rope()
-
+            try:
+                self.rotary_emb = LlamaRotaryEmbedding(config=config, device=None)
+            except TypeError:
+                # 兼容旧版本 transformers
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    dim=self.head_dim,
+                    max_position_embeddings=getattr(config, 'max_position_embeddings', 2048),
+                    base=getattr(config, 'rope_theta', 10000.0),
+                )
+                
     def _init_rope(self):
         # 使用 config 初始化，兼容所有版本
         try:
@@ -138,30 +119,48 @@ class LlamaAttention(_LlamaAttention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
+        # 计算 kv_seq_len
+        kv_seq_len = q_len
         if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
+            kv_seq_len += past_key_value[0].shape[2]
+        
+        # 🔍 添加调试信息（仅在第一层打印，避免刷屏）
+        if self.layer_idx == 0:
+            print(f"    [Layer 0 Attn] q_len={q_len}, kv_seq_len={kv_seq_len}, past_kv={'Yes' if past_key_value else 'No'}")
+        
+        # 生成 position_ids
         if position_ids is None:
-            # 这是一个关键步骤：如果 position_ids 为空，则根据 kv_seq_len 生成它
-            # 对于非增量解码，它应该是 [0, 1, 2, ..., kv_seq_len-1]
             if past_key_value is None:
                 position_ids = torch.arange(
-                    0, kv_seq_len, dtype=torch.long, device=query_states.device
+                    0, q_len, dtype=torch.long, device=query_states.device
                 ).unsqueeze(0)
-            # 对于增量解码，它应该只有当前步的索引
             else:
-                # 假设 position_ids 应该等于 (kv_seq_len - 1)，即上一次的长度
-                position_ids = torch.tensor(
-                    [kv_seq_len - 1], dtype=torch.long, device=query_states.device
+                cache_len = past_key_value[0].shape[2]
+                position_ids = torch.arange(
+                    cache_len, cache_len + q_len, 
+                    dtype=torch.long, device=query_states.device
                 ).unsqueeze(0)
+            
+            # 🔍 如果自动生成了 position_ids，打印警告
+            if self.layer_idx == 0:
+                print(f"    [Layer 0 Attn] ⚠️ Auto-generated position_ids: {position_ids}")
+        else:
+            # 🔍 打印传入的 position_ids
+            if self.layer_idx == 0:
+                print(f"    [Layer 0 Attn] ✅ Received position_ids: {position_ids}")
         
-        # 将 position_ids (张量) 传入
-        # 如果 self.rotary_emb 的 forward 签名是 (x, position_ids)
+        # 应用 rotary position embedding
         cos, sin = self.rotary_emb(value_states, position_ids)
+        
+        # 🔍 检查 RoPE 输出
+        if self.layer_idx == 0:
+            print(f"    [Layer 0 Attn] cos shape={cos.shape}, sin shape={sin.shape}")
+            print(f"    [Layer 0 Attn] cos sample: {cos[0, 0, :3].tolist()}")
+        
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        # 拼接 KV cache
         if past_key_value is not None:
-            # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
@@ -171,6 +170,7 @@ class LlamaAttention(_LlamaAttention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # 计算注意力
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -406,11 +406,12 @@ class LlamaModel(_LlamaModel):
         if attention_mask.dim() == 2:
             # 将 2D mask 扩展为 4D causal mask
             # (batch_size, seq_length) -> (batch_size, 1, seq_length, seq_length_with_past)
-            expanded_mask = attention_mask[:, None, None, :].to(dtype=inputs_embeds.dtype)
-            
+            #expanded_mask = attention_mask[:, None, None, :].to(dtype=inputs_embeds.dtype)
+            expanded_mask = attention_mask[:, None, None, :].expand(batch_size, 1, seq_length, seq_length_with_past).to(dtype=inputs_embeds.dtype)
             # 创建 causal mask (下三角矩阵)
             causal_mask = torch.tril(
-                torch.ones((seq_length, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device)
+                torch.ones((seq_length, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device),
+                diagonal=past_key_values_length
             ).view(1, 1, seq_length, seq_length_with_past)
             
             # 合并 padding mask 和 causal mask

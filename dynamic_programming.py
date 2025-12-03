@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
 
+import torch
+import torch.nn.functional as F
+
 class DynamicLayerOptimizer:
     """CLaSp 的动态层优化器"""
     
@@ -15,20 +18,23 @@ class DynamicLayerOptimizer:
         动态规划选择最优跳过层 (Algorithm 1)
         
         Args:
-            last_hidden_states: [L, hidden_size] 上次验证的完整隐藏状态
+            last_hidden_states: [L+1, hidden_size] 上次验证的完整隐藏状态
+                               (包含 embedding 层的输出)
         Returns:
-            attn_skip_layers, mlp_skip_layers: 最优跳过层集合
+            skip_layers: 最优跳过层列表
         """
         L = self.num_layers
         M = self.num_skip_layers
         d = self.hidden_size
         
         # g[i, j]: 跳过j层后第i层的最优隐藏状态
-        g = torch.zeros(L + 1, M + 1, d, device=last_hidden_states.device)
+        g = torch.zeros(L + 1, M + 1, d, device=last_hidden_states.device,
+                       dtype=last_hidden_states.dtype)
         g[0, 0] = last_hidden_states[0]
         
         # 记录决策路径
-        decisions = torch.zeros(L + 1, M + 1, dtype=torch.bool, device=last_hidden_states.device)
+        decisions = torch.zeros(L + 1, M + 1, dtype=torch.bool, 
+                               device=last_hidden_states.device)
         
         # 动态规划主循环
         for i in range(1, L + 1):
@@ -36,9 +42,8 @@ class DynamicLayerOptimizer:
             l = min(i - 1, M)
             
             if l > 0:
-                # 计算不跳过第i-1层的隐藏状态
-                with torch.no_grad():
-                    G = self._forward_layer(i - 1, g[i - 1, 1:l + 1])
+                # 计算不跳过第i-1层的隐藏状态 (批量处理)
+                G = self._forward_layer(i - 1, g[i - 1, 1:l + 1])
                 
                 # 计算 cosine 相似度
                 F_cat = torch.cat([
@@ -47,19 +52,12 @@ class DynamicLayerOptimizer:
                 ], dim=0)
                 
                 target_norm = F.normalize(last_hidden_states[i].unsqueeze(0), dim=-1)
-                #sigma = torch.matmul(F_cat, target_norm.T).squeeze()
-                sigma = (F_cat * target_norm).sum(dim=-1).squeeze()
-                # 插入调试代码：
-                # print(f"DEBUG: Layer i={i}, Max skips M={M}, Current l={l}")
-                # print(f"DEBUG: sigma shape: {sigma.shape}, numel: {sigma.numel()}")
-                sigma_no_skip = sigma[:l] # 对应 F_cat 的上半部分 (No Skip)
-                sigma_skip = sigma[l:]    # 对应 F_cat 的下半部分 (Skip)
-                # print(f"DEBUG: sigma[:l] (No Skip) shape: {sigma_no_skip.shape}, numel: {sigma_no_skip.numel()}")
-                # print(f"DEBUG: sigma[l:] (Skip) shape: {sigma_skip.shape}, numel: {sigma_skip.numel()}")
-                if sigma_no_skip.numel() == 0 or sigma_skip.numel() == 0:
-                    print(f"CRITICAL ALERT: Empty tensor detected! i={i}, l={l}")
+                sigma = (F_cat * target_norm).sum(dim=-1)
+                
+                sigma_no_skip = sigma[:l]
+                sigma_skip = sigma[l:]
+                
                 # 决策：跳过还是不跳过
-                # 添加防御性检查：如果切片为空，则最大值设为负无穷大
                 max_no_skip = sigma_no_skip.max() if sigma_no_skip.numel() > 0 else -float('inf')
                 max_skip = sigma_skip.max() if sigma_skip.numel() > 0 else -float('inf')
 
@@ -69,6 +67,7 @@ class DynamicLayerOptimizer:
                 else:
                     g[i, 1:l + 1] = g[i - 1, :l]
                     decisions[i, 1:l + 1] = True  # 跳过
+                    
             if i <= M:
                 g[i, i] = g[i - 1, i - 1]
                 decisions[i, i] = True
@@ -78,15 +77,49 @@ class DynamicLayerOptimizer:
         return skip_layers
     
     def _forward_layer(self, layer_idx, hidden_states):
-        """前向传播单层（简化版本）"""
+        """
+        前向传播单层 (批量处理多个候选状态)
+        
+        Args:
+            layer_idx: 层索引
+            hidden_states: (num_candidates, hidden_size) 多个候选隐藏状态
+        Returns:
+            (num_candidates, hidden_size) 前向传播后的隐藏状态
+        """
         layer = self.model.model.layers[layer_idx]
         
-        # 这里需要根据实际情况调整
         with torch.no_grad():
-            target_dtype = layer.input_layernorm.weight.dtype 
+            target_dtype = layer.input_layernorm.weight.dtype
             hidden_states = hidden_states.to(target_dtype)
-            output = layer(hidden_states.unsqueeze(0))
-            return output[0].squeeze(0)
+            
+            num_candidates = hidden_states.shape[0]
+            
+            # 方法1: 逐个处理（更稳定）
+            outputs = []
+            for i in range(num_candidates):
+                # 取出单个候选，形状 (hidden_size,)
+                h = hidden_states[i:i+1]  # (1, hidden_size)
+                
+                # 扩展为 (batch=1, seq_len=1, hidden_size)
+                h = h.unsqueeze(0)  # (1, 1, hidden_size)
+                
+                # 创建 position_ids (因为只有1个token，位置为0)
+                position_ids = torch.zeros((1, 1), dtype=torch.long, device=h.device)
+                
+                # 调用 layer
+                output = layer(
+                    h,
+                    position_ids=position_ids,
+                    past_key_value=None,
+                    use_cache=False
+                )
+                
+                # output[0] 形状: (1, 1, hidden_size)
+                # 压缩为 (1, hidden_size)
+                outputs.append(output[0].squeeze(0))
+            
+            # 堆叠所有输出: (num_candidates, hidden_size)
+            return torch.cat(outputs, dim=0)
     
     def _backtrack(self, decisions, L, M):
         """回溯找到最优跳过层"""

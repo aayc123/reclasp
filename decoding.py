@@ -66,7 +66,18 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
     layer_optimizer = DynamicLayerOptimizer(model, num_skip_layers)
     
     # 初始跳过层（可以随机初始化或使用固定配置）
-    current_skip_layers = list(range(10, 30))  # 初始配置
+    # current_skip_layers = list(range(10, 30))  # 初始配置
+    # 根据 num_skip_layers 动态计算
+    num_layers = model.config.num_hidden_layers
+    skip_ratio = num_skip_layers / num_layers
+    # 均匀分布跳过层
+    import numpy as np
+    current_skip_layers = list(np.linspace(
+        num_layers // 4, 
+        num_layers * 3 // 4, 
+        num_skip_layers, 
+        dtype=int
+    ))
     model.set_skip_layers(attn_skip_layer_id_set=current_skip_layers, mlp_skip_layer_id_set=[])
     
     n_matched = 0
@@ -196,7 +207,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                 # 根据 update_interval 决定是否更新跳过层
                 if update_counter % update_interval == 0:
                     # 提取最后接受 token 的所有层隐藏状态
-                    last_accepted_hidden = [h[:, max_matched - 1, :] 
+                    last_accepted_hidden = [h[0, max_matched - 1, :] 
                                            for h in last_hidden_states]
                     last_accepted_hidden = torch.stack(last_accepted_hidden, dim=0)
                     
@@ -261,7 +272,17 @@ def base_generate(model, tokenizer, input_ids, max_new_tokens=10,
     
     with torch.no_grad():
         for step in range(max_new_tokens):
+            if past_key_values is None:
+                # 第一次调用：处理整个 prompt
+                seq_len = current_input_ids.shape[-1]
+                position_ids = torch.arange(0, seq_len, dtype=torch.long, device=model.device).unsqueeze(0)
+            else:
+                # 后续调用：只处理单个 token
+                cache_len = past_key_values[0][0].shape[2]
+                position_ids = torch.tensor([[cache_len]], dtype=torch.long, device=model.device)
+            
             output = model(input_ids=current_input_ids,
+                           position_ids=position_ids,
                     past_key_values=past_key_values,
                     return_dict=True,
                     use_cache=True)
