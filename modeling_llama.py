@@ -55,9 +55,11 @@ _mlp_skip_layer_id_set = []
 # _attn_skip_layer_id_set = [1, 5, 6, 8, 10, 11, 14, 18, 20, 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
 # _mlp_skip_layer_id_set = [5, 9, 10, 18, 25, 27, 29]
 
-_attn_skip_layer_id_set = [3, 5, 6, 8, 10, 11, 14, 15, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37]
-_mlp_skip_layer_id_set = [6, 9, 10, 11, 15, 24, 25, 27, 28, 35]
+# _attn_skip_layer_id_set = [3, 5, 6, 8, 10, 11, 14, 15, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37]
+# _mlp_skip_layer_id_set = [6, 9, 10, 11, 15, 24, 25, 27, 28, 35]
 
+_attn_skip_layer_id_set = [10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
+_mlp_skip_layer_id_set = [12, 16, 20, 24, 28]
 print('(Re-)Loading modeling...')
 
 
@@ -125,8 +127,8 @@ class LlamaAttention(_LlamaAttention):
             kv_seq_len += past_key_value[0].shape[2]
         
         # 🔍 添加调试信息（仅在第一层打印，避免刷屏）
-        if self.layer_idx == 0:
-            print(f"    [Layer 0 Attn] q_len={q_len}, kv_seq_len={kv_seq_len}, past_kv={'Yes' if past_key_value else 'No'}")
+        # if self.layer_idx == 0:
+        #     print(f"    [Layer 0 Attn] q_len={q_len}, kv_seq_len={kv_seq_len}, past_kv={'Yes' if past_key_value else 'No'}")
         
         # 生成 position_ids
         if position_ids is None:
@@ -144,18 +146,21 @@ class LlamaAttention(_LlamaAttention):
             # 🔍 如果自动生成了 position_ids，打印警告
             if self.layer_idx == 0:
                 print(f"    [Layer 0 Attn] ⚠️ Auto-generated position_ids: {position_ids}")
-        else:
-            # 🔍 打印传入的 position_ids
-            if self.layer_idx == 0:
-                print(f"    [Layer 0 Attn] ✅ Received position_ids: {position_ids}")
+        # else:
+        #     # 🔍 打印传入的 position_ids
+        #     if self.layer_idx == 0:
+        #         print(f"    [Layer 0 Attn] ✅ Received position_ids: {position_ids}")
         
         # 应用 rotary position embedding
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        
+        #cos, sin = self.rotary_emb(value_states, position_ids)
+        # 修复后的代码
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos = cos.to(dtype=hidden_states.dtype)
+        sin = sin.to(dtype=hidden_states.dtype)
         # 🔍 检查 RoPE 输出
-        if self.layer_idx == 0:
-            print(f"    [Layer 0 Attn] cos shape={cos.shape}, sin shape={sin.shape}")
-            print(f"    [Layer 0 Attn] cos sample: {cos[0, 0, :3].tolist()}")
+        # if self.layer_idx == 0:
+        #     print(f"    [Layer 0 Attn] cos shape={cos.shape}, sin shape={sin.shape}")
+        #     print(f"    [Layer 0 Attn] cos sample: {cos[0, 0, :3].tolist()}")
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
