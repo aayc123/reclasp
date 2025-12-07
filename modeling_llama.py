@@ -49,7 +49,8 @@ enabled_bitfit = False
 
 _attn_skip_layer_id_set = []
 _mlp_skip_layer_id_set = []
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # _attn_skip_layer_id_set = [8,10,15,18,20,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,]
 
 # _attn_skip_layer_id_set = [1, 5, 6, 8, 10, 11, 14, 18, 20, 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
@@ -58,8 +59,8 @@ _mlp_skip_layer_id_set = []
 # _attn_skip_layer_id_set = [3, 5, 6, 8, 10, 11, 14, 15, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37]
 # _mlp_skip_layer_id_set = [6, 9, 10, 11, 15, 24, 25, 27, 28, 35]
 
-_attn_skip_layer_id_set = [10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
-_mlp_skip_layer_id_set = [12, 16, 20, 24, 28]
+_attn_skip_layer_id_set = [ 10,12,14,16,18,20]
+_mlp_skip_layer_id_set = [24, 28]
 print('(Re-)Loading modeling...')
 
 
@@ -146,21 +147,12 @@ class LlamaAttention(_LlamaAttention):
             # 🔍 如果自动生成了 position_ids，打印警告
             if self.layer_idx == 0:
                 print(f"    [Layer 0 Attn] ⚠️ Auto-generated position_ids: {position_ids}")
-        # else:
-        #     # 🔍 打印传入的 position_ids
-        #     if self.layer_idx == 0:
-        #         print(f"    [Layer 0 Attn] ✅ Received position_ids: {position_ids}")
-        
-        # 应用 rotary position embedding
-        #cos, sin = self.rotary_emb(value_states, position_ids)
+                
         # 修复后的代码
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         cos = cos.to(dtype=hidden_states.dtype)
         sin = sin.to(dtype=hidden_states.dtype)
-        # 🔍 检查 RoPE 输出
-        # if self.layer_idx == 0:
-        #     print(f"    [Layer 0 Attn] cos shape={cos.shape}, sin shape={sin.shape}")
-        #     print(f"    [Layer 0 Attn] cos sample: {cos[0, 0, :3].tolist()}")
+  
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -410,8 +402,6 @@ class LlamaModel(_LlamaModel):
         
         if attention_mask.dim() == 2:
             # 将 2D mask 扩展为 4D causal mask
-            # (batch_size, seq_length) -> (batch_size, 1, seq_length, seq_length_with_past)
-            #expanded_mask = attention_mask[:, None, None, :].to(dtype=inputs_embeds.dtype)
             expanded_mask = attention_mask[:, None, None, :].expand(batch_size, 1, seq_length, seq_length_with_past).to(dtype=inputs_embeds.dtype)
             # 创建 causal mask (下三角矩阵)
             causal_mask = torch.tril(

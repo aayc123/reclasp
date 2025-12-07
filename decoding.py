@@ -1,10 +1,10 @@
-
 import torch
 import torch.nn as nn
 import time
 #from transformers import top_k_top_p_filtering
 from .dynamic_programming import DynamicLayerOptimizer
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 import torch
 import torch.nn.functional as F
 
@@ -135,7 +135,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                     
                     with model.self_draft():
                         draft_output = model(input_ids=draft_current_input_ids,
-                                            position_ids=draft_position_ids, # ⬅️ 添加或修改这行
+                                            position_ids=draft_position_ids, 
                                             past_key_values=draft_past_key_values,
                                             return_dict=True,
                                             use_cache=True)
@@ -222,16 +222,16 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                                          mlp_skip_layer_id_set=[])
                     current_skip_layers = new_skip_layers
                     
-                    print(f"Updated skip layers: {len(new_skip_layers)} layers")
+                    # print(f"Updated skip layers: {len(new_skip_layers)} layers")
             
             if early_stop and tokenizer.eos_token_id in output_ids[0].tolist():
                 break
     
     step = min(step, max_new_tokens)
     generate_ids = generate_ids[:, :step]
-    
+    full_sequence = torch.cat([input_ids, generate_ids], dim=1)
     return {
-        'generate_ids': generate_ids,
+        'generate_ids': full_sequence,
         'matchness': n_matched / n_drafted if n_drafted > 0 else 0,
         'num_drafted_tokens': n_drafted,
         'accept_counts': step_accept_counts
