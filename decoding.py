@@ -7,7 +7,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "4" 
 import torch
 import torch.nn.functional as F
-
+import numpy as np
 def top_k_top_p_filtering(
     logits: torch.FloatTensor,
     top_k: int = 0,
@@ -76,15 +76,17 @@ def fixed_clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_
     print(f"固定跳层配置: {skip_layers} (跳过{num_skip}/{len(dynamic_layers)}层)")
     return result
 
-def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=False,
-                   max_step_draft=8, num_skip_layers=20, update_interval=64,
+def clasp_generate(model, tokenizer, input_ids, max_new_tokens=15, early_stop=False,
+                   max_step_draft=8, num_skip_layers=8, update_interval=64,
                    do_sample=False, top_k=0, top_p=0.85, temperature=0.2):
     """
     CLaSp: 动态层跳过的自推测解码
     """    
     step = 0
     update_counter = 0
-    
+    n_matched = 0
+    n_drafted = 0
+    n_rounds  = 0
     current_input_ids = input_ids
     generate_ids = torch.empty([input_ids.size(0), max_new_tokens + max_step_draft], 
                                 dtype=torch.long, device=model.device)
@@ -96,19 +98,17 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
     # 初始跳过层（可以随机初始化或使用固定配置）
     # 根据 num_skip_layers 动态计算
     num_layers = model.config.num_hidden_layers
-    skip_ratio = num_skip_layers / num_layers
-    # 均匀分布跳过层
-    import numpy as np
-    current_skip_layers = list(np.linspace(
-        num_layers // 4, 
-        num_layers * 3 // 4, 
-        num_skip_layers, 
-        dtype=int
-    ))
+    fixed_front = 10  # 固定前10层
+    fixed_back = 10   # 固定后10层
+    dynamic_range = list(range(fixed_front, num_layers - fixed_back))  # [10, 11, ..., 21]
+
+    # 从中间12层中跳过 num_skip_layers 个
+    # 初始化：均匀采样
+    num_skip = min(num_skip_layers, len(dynamic_range))
+    skip_indices = np.linspace(0, len(dynamic_range)-1, num_skip, dtype=int)
+    current_skip_layers = [dynamic_range[i] for i in skip_indices]
     model.set_skip_layers(attn_skip_layer_id_set=current_skip_layers, mlp_skip_layer_id_set=[])
     
-    n_matched = 0
-    n_drafted = 0
     last_hidden_states = None  # 存储上次验证的隐藏状态
     step_accept_counts=[]
     with torch.no_grad():
@@ -225,6 +225,8 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                 
                 n_matched += max_matched - 1
                 n_drafted += drafted_n_tokens
+                n_rounds += 1
+                step_accept_counts.append(max_matched - 1)
                 
                 # ========== 阶段 3: 层优化 (CLaSp 特有!) ==========
                 last_hidden_states = output['hidden_states']  # 更新隐藏状态
@@ -255,9 +257,32 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
     step = min(step, max_new_tokens)
     generate_ids = generate_ids[:, :step]
     full_sequence = torch.cat([input_ids, generate_ids], dim=1)
+    # 计算τ和matchness
+    tau = (n_matched + n_rounds) / n_rounds if n_rounds > 0 else 1.0
+    matchness = n_matched / n_drafted if n_drafted > 0 else 0.0
+    
+    print(f"\n{'='*60}")
+    print(f"CLaSp生成完成:")
+    print(f"  总tokens: {step}")
+    print(f"  Draft轮数: {n_rounds}")
+    print(f"  总draft tokens: {n_drafted}")
+    print(f"  总接受tokens: {n_matched}")
+    print(f"  τ (平均接受长度): {tau:.3f}")
+    print(f"  Matchness (接受率): {matchness:.3f}")
+    print(f"{'='*60}\n")
+    
+    # return {
+    #     'generate_ids': full_sequence,
+    #     'tau': tau,
+    #     'matchness': matchness,
+    #     'num_drafted_tokens': n_drafted,
+    #     'accept_counts': step_accept_counts,
+    #     'num_rounds': n_rounds
+    # }
+
     return {
         'generate_ids': full_sequence,
-        'matchness': n_matched / n_drafted if n_drafted > 0 else 0,
+        'matchness': matchness,
         'num_drafted_tokens': n_drafted,
         'accept_counts': step_accept_counts
     }
