@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 class DynamicLayerOptimizer:
     """CLaSp 的动态层优化器"""
     
@@ -69,9 +69,7 @@ class DynamicLayerOptimizer:
             if i <= M:
                 g[i, i] = g[i - 1, i - 1]
                 decisions[i, i] = True
-            # 检查是否有这样的调试输出
-            print(f"Optimal skipped layer set S:")
-            print(f"Number of layers skipped")
+           
         # 回溯找到最优跳过层集合
         skip_layers = self._backtrack(decisions, L, M)
         return skip_layers

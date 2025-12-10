@@ -50,7 +50,7 @@ enabled_bitfit = False
 _attn_skip_layer_id_set = []
 _mlp_skip_layer_id_set = []
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 # _attn_skip_layer_id_set = [8,10,15,18,20,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,]
 
 # _attn_skip_layer_id_set = [1, 5, 6, 8, 10, 11, 14, 18, 20, 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
@@ -59,8 +59,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # _attn_skip_layer_id_set = [3, 5, 6, 8, 10, 11, 14, 15, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37]
 # _mlp_skip_layer_id_set = [6, 9, 10, 11, 15, 24, 25, 27, 28, 35]
 
-_attn_skip_layer_id_set = [ 10,12,14,16,18,20]
-_mlp_skip_layer_id_set = [24, 28]
+_attn_skip_layer_id_set = [ 14, 15, 16]
+_mlp_skip_layer_id_set = [15]
 print('(Re-)Loading modeling...')
 
 
@@ -100,8 +100,6 @@ class LlamaAttention(_LlamaAttention):
                 dim=self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
             )
-
-
 
     def forward(
         self,

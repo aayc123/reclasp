@@ -4,7 +4,7 @@ import time
 #from transformers import top_k_top_p_filtering
 from .dynamic_programming import DynamicLayerOptimizer
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "4" 
 import torch
 import torch.nn.functional as F
 
@@ -48,8 +48,36 @@ def top_k_top_p_filtering(
     
     return logits
 
+def fixed_clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=True,
+                         do_sample=False,temperature=0,dynamic_layers=None,skip_ratio=0.5):
+    """
+    使用固定跳层的简化CLaSp（用于调试）
+    """
+    if dynamic_layers is None:
+        # Llama3-8B: 固定前后各10层，优化中间12层
+        dynamic_layers = list(range(10, 22))  # 第10-21层
+    
+    # 选择跳过的层
+    num_skip = int(len(dynamic_layers) * skip_ratio)
+    skip_layers = dynamic_layers[:num_skip]  # 简单取前几个
+    
+    model.set_skip_layers(attn_skip_layer_id_set=skip_layers, mlp_skip_layer_id_set=[])
+    
+    # 使用现有的self_speculative_sample或exact_self_speculative_generate
+    result = self_speculative_sample(
+        model, tokenizer, input_ids, 
+        max_new_tokens=max_new_tokens,
+        max_step_draft=8,
+        th_stop_draft=0.5,
+        do_sample=False,
+        temperature=0.0
+    )
+    
+    print(f"固定跳层配置: {skip_layers} (跳过{num_skip}/{len(dynamic_layers)}层)")
+    return result
+
 def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=False,
-                   max_step_draft=8, num_skip_layers=20, update_interval=4,
+                   max_step_draft=8, num_skip_layers=20, update_interval=64,
                    do_sample=False, top_k=0, top_p=0.85, temperature=0.2):
     """
     CLaSp: 动态层跳过的自推测解码
@@ -66,7 +94,6 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
     layer_optimizer = DynamicLayerOptimizer(model, num_skip_layers)
     
     # 初始跳过层（可以随机初始化或使用固定配置）
-    # current_skip_layers = list(range(10, 30))  # 初始配置
     # 根据 num_skip_layers 动态计算
     num_layers = model.config.num_hidden_layers
     skip_ratio = num_skip_layers / num_layers
@@ -88,7 +115,6 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
         while True:
             if step >= max_new_tokens:
                 break
-            
             # ========== 阶段 1: 草稿生成 ==========
             if step == 0:
                 # 第一个 token 使用完整模型
@@ -110,7 +136,6 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                 past_key_values = output['past_key_values']
                 last_hidden_states = output['hidden_states']  # 保存隐藏状态
                 step += 1
-                
             else:
                 # 使用当前跳过层配置生成草稿
                 draft_current_input_ids = current_input_ids
@@ -122,7 +147,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                     # 确保 draft_past_key_values 不为 None
                     if draft_past_key_values is not None and draft_past_key_values[0] is not None:
                         # 进一步检查 KV 缓存张量是否为 None
-                        k_cache = draft_past_key_values[0][0] # k_cache 是第一个 Transformer 层的 Key cache 张量
+                        k_cache = draft_past_key_values[0][0] 
                         cache_len = k_cache.shape[2] if k_cache is not None else 0
                     else:
                         cache_len = 0
@@ -168,7 +193,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=Fa
                     cache_len, cache_len + seq_len, dtype=torch.long, device=model.device
                 ).unsqueeze(0) # (1, seq_len)
                 output = model(input_ids=drafted_input_ids,
-                              position_ids=position_ids, # ⬅️ 添加这行
+                              position_ids=position_ids, 
                               past_key_values=past_key_values,
                               return_dict=True,
                               use_cache=True,
@@ -457,7 +482,7 @@ def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=10, earl
     
     # 🔍 添加调试计数器
     debug_round = 0
-    
+    n_verification_rounds=0
     with torch.no_grad():
         while True:
             if step >= max_new_tokens:
@@ -494,6 +519,7 @@ def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=10, earl
 
             else:
                 debug_round += 1
+                n_verification_rounds+=1
                 print(f"\n{'─'*60}")
                 print(f"🔄 Round {debug_round}: Drafting + Verification")
                 print(f"{'─'*60}")
@@ -643,14 +669,14 @@ def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=10, earl
                             new_th_stop_draft = th_stop_draft - auto_parameters[3]
                     th_stop_draft = auto_parameters[4] * th_stop_draft + \
                                    (1-auto_parameters[4]) * new_th_stop_draft
-
+                tau = (n_matched + n_verification_rounds) / n_verification_rounds
             if early_stop and tokenizer.eos_token_id in output_ids[0].tolist():
                 print(f"\n🛑 Early stop triggered (EOS token found)\n")
                 break
-
+    final_tau = (n_matched + n_verification_rounds) / n_verification_rounds if n_verification_rounds > 0 else 0
     step = min(step, max_new_tokens)
     generate_ids = generate_ids[:, :step]
-    
+    full_sequence = torch.cat([input_ids, generate_ids], dim=1)
     # 🔍 最终统计
     final_matchness = n_matched/n_drafted if n_drafted > 0 else 0
     print(f"\n{'='*60}")
@@ -659,10 +685,11 @@ def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=10, earl
     print(f"   Total drafted: {n_drafted}")
     print(f"   Total matched: {n_matched}")
     print(f"   Matchness: {final_matchness:.3f}")
+    print(f"   Matchness: {final_matchness:.3f}")
     print(f"{'='*60}\n")
             
     return {
-        'generate_ids': generate_ids,
+        'generate_ids': full_sequence,
         'matchness': final_matchness,
         'num_drafted_tokens': n_drafted,
         'th_stop_draft': th_stop_draft,
