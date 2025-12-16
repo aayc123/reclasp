@@ -48,156 +48,204 @@ def top_k_top_p_filtering(
     
     return logits
 
-def fixed_clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=True,
-                         do_sample=False,temperature=0,dynamic_layers=None,skip_ratio=0.5):
-    """
-    使用固定跳层的简化CLaSp（用于调试）
-    """
-    if dynamic_layers is None:
-        # Llama3-8B: 固定前后各10层，优化中间12层
-        dynamic_layers = list(range(10, 22))  # 第10-21层
-    
-    # 选择跳过的层
-    num_skip = int(len(dynamic_layers) * skip_ratio)
-    skip_layers = dynamic_layers[:num_skip]  # 简单取前几个
-    
-    model.set_skip_layers(attn_skip_layer_id_set=skip_layers, mlp_skip_layer_id_set=[])
-    
-    # 使用现有的self_speculative_sample或exact_self_speculative_generate
-    result = self_speculative_sample(
-        model, tokenizer, input_ids, 
-        max_new_tokens=max_new_tokens,
-        max_step_draft=8,
-        th_stop_draft=0.5,
-        do_sample=False,
-        temperature=0.0
-    )
-    
-    print(f"固定跳层配置: {skip_layers} (跳过{num_skip}/{len(dynamic_layers)}层)")
-    return result
 
-def clasp_generate(model, tokenizer, input_ids, max_new_tokens=15, early_stop=False,
-                   max_step_draft=8, num_skip_layers=8, update_interval=64,
-                   do_sample=False, top_k=0, top_p=0.85, temperature=0.2):
+import time
+import torch
+import torch.nn as nn
+import time
+from datetime import datetime
+import json
+import csv
+
+def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=False,
+                   max_step_draft=8, num_skip_layers=15, update_interval=8,
+                   do_sample=False, top_k=0, top_p=0.85, temperature=0.0,th_stop_draft=0.7,
+                   log_file="clasp_timing_log.json"):
     """
     CLaSp: 动态层跳过的自推测解码
-    """    
+    添加详细的时间记录功能
+    """
+    # 初始化时间记录数据结构
+    timing_records = {
+        "metadata": {
+            "model": model.__class__.__name__,
+            "max_new_tokens": max_new_tokens,
+            "max_step_draft": max_step_draft,
+            "num_skip_layers": num_skip_layers,
+            "update_interval": update_interval,
+            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        },
+        "rounds": []  # 记录每一轮的时间
+    }
+    
+    # 创建CSV文件用于记录
+    csv_filename = log_file.replace('.json', '.csv')
+    csv_file = open(csv_filename, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['round', 'draft_time_ms', 'verify_time_ms', 'dp_time_ms', 
+                         'drafted_tokens', 'accepted_tokens', 'skip_layers'])
+    
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    
     step = 0
     update_counter = 0
     n_matched = 0
     n_drafted = 0
-    n_rounds  = 0
+    n_rounds = 0
     current_input_ids = input_ids
     generate_ids = torch.empty([input_ids.size(0), max_new_tokens + max_step_draft], 
-                                dtype=torch.long, device=model.device)
+                               dtype=torch.long, device=model.device)
     past_key_values = None
     
-    # 初始化动态层优化器
-    layer_optimizer = DynamicLayerOptimizer(model, num_skip_layers)
+    fixed_skip_layers = [11, 14, 18, 22, 24, 25, 26]
+    current_skip_layers= [10, 11, 24, 25, 27, 28]
+    fixed_mlp_skip = [11, 14, 18, 22, 24, 25, 26]
+    model.set_skip_layers(attn_skip_layer_id_set=fixed_skip_layers, 
+                         mlp_skip_layer_id_set=fixed_mlp_skip)
     
-    # 初始跳过层（可以随机初始化或使用固定配置）
-    # 根据 num_skip_layers 动态计算
-    num_layers = model.config.num_hidden_layers
-    fixed_front = 10  # 固定前10层
-    fixed_back = 10   # 固定后10层
-    dynamic_range = list(range(fixed_front, num_layers - fixed_back))  # [10, 11, ..., 21]
-
-    # 从中间12层中跳过 num_skip_layers 个
-    # 初始化：均匀采样
-    num_skip = min(num_skip_layers, len(dynamic_range))
-    skip_indices = np.linspace(0, len(dynamic_range)-1, num_skip, dtype=int)
-    current_skip_layers = [dynamic_range[i] for i in skip_indices]
-    model.set_skip_layers(attn_skip_layer_id_set=current_skip_layers, mlp_skip_layer_id_set=[])
-    
-    last_hidden_states = None  # 存储上次验证的隐藏状态
-    step_accept_counts=[]
+    last_hidden_states = None
+    step_accept_counts = []
+    need_hidden_states = 0
     with torch.no_grad():
         while True:
             if step >= max_new_tokens:
                 break
+            
+            # 初始化本轮时间记录
+            round_timing = {
+                "round": n_rounds + 1,
+                "draft_time_ms": 0,
+                "verify_time_ms": 0,
+                "dp_time_ms": 0,
+                "drafted_tokens": 0,
+                "accepted_tokens": 0,
+                "skip_layers": fixed_skip_layers if n_rounds == 0 else current_skip_layers
+            }
+            
             # ========== 阶段 1: 草稿生成 ==========
             if step == 0:
                 # 第一个 token 使用完整模型
+                round_start = time.perf_counter()
+                
                 seq_len = current_input_ids.shape[-1]
                 position_ids = torch.arange(
                     0, seq_len, dtype=torch.long, device=model.device
                 ).unsqueeze(0)
                 output = model(input_ids=current_input_ids,
                                position_ids=position_ids,
-                              past_key_values=past_key_values,
-                              return_dict=True,
-                              use_cache=True,
-                              output_hidden_states=True)  # 需要隐藏状态
+                               past_key_values=past_key_values,
+                               return_dict=True,
+                               use_cache=True,
+                               output_hidden_states=False)
                 logits = output['logits'][:, -1:]
                 output_ids = sample(logits, do_sample=do_sample, top_k=top_k, 
                                    top_p=top_p, temperature=temperature)
+                
+                draft_end = time.perf_counter()
+                round_timing["draft_time_ms"] = (draft_end - round_start) * 1000
+                round_timing["verify_time_ms"] = 0  # 第一轮没有验证
+                round_timing["dp_time_ms"] = 0
+                round_timing["drafted_tokens"] = 1
+                round_timing["accepted_tokens"] = 1
+                
                 generate_ids[:, step] = output_ids
                 current_input_ids = output_ids
                 past_key_values = output['past_key_values']
-                last_hidden_states = output['hidden_states']  # 保存隐藏状态
                 step += 1
+                n_rounds += 1
+                n_drafted += 1
+                n_matched += 1
+                
+                # 记录本轮时间
+                timing_records["rounds"].append(round_timing)
+                csv_writer.writerow([
+                    round_timing["round"],
+                    round_timing["draft_time_ms"],
+                    round_timing["verify_time_ms"],
+                    round_timing["dp_time_ms"],
+                    round_timing["drafted_tokens"],
+                    round_timing["accepted_tokens"],
+                    len(round_timing["skip_layers"])
+                ])
+                
             else:
-                # 使用当前跳过层配置生成草稿
+                # ========== DRAFT 阶段计时 ==========
+                draft_start = time.perf_counter()
+                
                 draft_current_input_ids = current_input_ids
-                draft_past_key_values = past_key_values
+                draft_kv_cache = past_key_values
                 draft_tokens = [current_input_ids]
+                draft_confidences = []
+                early_stopped = False
                 
                 for draft_step in range(max_step_draft):
-                    # 1. 计算缓存长度 (cache_len) 作为当前 token 的起始位置
-                    # 确保 draft_past_key_values 不为 None
-                    if draft_past_key_values is not None and draft_past_key_values[0] is not None:
-                        # 进一步检查 KV 缓存张量是否为 None
-                        k_cache = draft_past_key_values[0][0] 
-                        cache_len = k_cache.shape[2] if k_cache is not None else 0
-                    else:
-                        cache_len = 0
-                    
-                    # 2. 计算 position_ids：对于单个 token，其位置是 cache_len
-                    # 确保 position_ids 是一个张量 (1, 1)
-                    draft_position_ids = torch.arange(
-                        cache_len, cache_len + 1, dtype=torch.long, device=model.device
-                    ).unsqueeze(0) # (1, 1) 张量
+                    cache_len = past_key_values[0][0].shape[2]
+                    pos_id = cache_len + draft_step
+                    draft_position_ids = torch.tensor([[pos_id]], device=model.device)
                     
                     with model.self_draft():
                         draft_output = model(input_ids=draft_current_input_ids,
-                                            position_ids=draft_position_ids, 
-                                            past_key_values=draft_past_key_values,
-                                            return_dict=True,
-                                            use_cache=True)
+                                             position_ids=draft_position_ids,
+                                             past_key_values=draft_kv_cache,
+                                             return_dict=True,
+                                             use_cache=True)
                     
-                    draft_output_ids = sample(draft_output['logits'], 
-                                             do_sample=do_sample, top_k=top_k, 
-                                             top_p=top_p, temperature=temperature)
+                    # 使用增强的sample函数，同时获取token和置信度
+                    draft_output_ids, confidence = sample_with_confidence(
+                        draft_output['logits'][:, -1:],
+                        return_probs=True,
+                        do_sample=do_sample,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature
+                    )
+                    
+                    # 记录置信度
+                    conf_value = confidence.item() if confidence.numel() == 1 else confidence.mean().item()
+                    draft_confidences.append(conf_value)
+                    
                     draft_tokens.append(draft_output_ids)
                     draft_current_input_ids = draft_output_ids
-                    draft_past_key_values = draft_output['past_key_values']
+                    draft_kv_cache = draft_output['past_key_values']
+                    
+                    # 检查是否应该提前停止
+                    if conf_value < th_stop_draft:
+                        early_stopped = True
+                        # print(f"  ⚠️ Draft early stop at step {draft_step+1}: "
+                        #       f"confidence {conf_value:.3f} < threshold {th_stop_draft}")
+                        break
                     
                     if step + draft_step + 2 >= max_new_tokens:
                         break
                 
+                draft_end = time.perf_counter()
+                draft_time = (draft_end - draft_start) * 1000
+                round_timing["draft_time_ms"] = draft_time
+                round_timing["early_stopped"] = early_stopped
+                round_timing["min_confidence"] = min(draft_confidences) if draft_confidences else 1.0
+                
                 drafted_n_tokens = len(draft_tokens) - 1
                 drafted_input_ids = torch.cat(draft_tokens, dim=1)
+                round_timing["drafted_tokens"] = drafted_n_tokens
                 
-                # ========== 阶段 2: 验证 ==========
-                # 假设 input_ids 是 (batch_size, seq_len)
-                # past_key_values 存储了 prompt 和之前生成的 token 的 KV 缓存
-                # 我们可以根据 past_key_values 的长度来确定起始位置
-                
-                # 获取 KV 缓存的长度 (即已处理的总长度)
+                # ========== VERIFY 阶段计时 ==========
+                verify_start = time.perf_counter()
+                verify_past_key_values = past_key_values
                 cache_len = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-                # drafted_input_ids 的长度
                 seq_len = drafted_input_ids.shape[-1]
-                
-                # 计算 position_ids，从 cache_len 开始
                 position_ids = torch.arange(
                     cache_len, cache_len + seq_len, dtype=torch.long, device=model.device
-                ).unsqueeze(0) # (1, seq_len)
+                ).unsqueeze(0)
+                flag=True if need_hidden_states>=1 else False
                 output = model(input_ids=drafted_input_ids,
-                              position_ids=position_ids, 
-                              past_key_values=past_key_values,
-                              return_dict=True,
-                              use_cache=True,
-                              output_hidden_states=True)
+                               position_ids=position_ids,
+                               past_key_values=past_key_values,
+                               return_dict=True,
+                               use_cache=True,
+                               output_hidden_states=flag)
                 
                 logits = output['logits']
                 output_ids = sample(logits, do_sample=do_sample, top_k=top_k, 
@@ -205,8 +253,6 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=15, early_stop=Fa
                 
                 # 检查匹配
                 max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0).sum(-1).item() + 1
-                if step > 0: 
-                    step_accept_counts.append(max_matched)
                 max_of_max_matched = output_ids.size(1)
                 
                 if max_of_max_matched != max_matched:
@@ -219,6 +265,11 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=15, early_stop=Fa
                 else:
                     past_key_values = output['past_key_values']
                 
+                verify_end = time.perf_counter()
+                verify_time = (verify_end - verify_start) * 1000  # 转换为毫秒
+                round_timing["verify_time_ms"] = verify_time
+                round_timing["accepted_tokens"] = max_matched - 1
+                
                 generate_ids[:, step:step + output_ids.size(1)] = output_ids
                 current_input_ids = output_ids[:, -1:]
                 step += output_ids.size(1)
@@ -226,70 +277,179 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=15, early_stop=Fa
                 n_matched += max_matched - 1
                 n_drafted += drafted_n_tokens
                 n_rounds += 1
-                step_accept_counts.append(max_matched - 1)
+                step_accept_counts.append(max_matched)
                 
-                # ========== 阶段 3: 层优化 (CLaSp 特有!) ==========
-                last_hidden_states = output['hidden_states']  # 更新隐藏状态
-                update_counter += 1
-                
-                # 根据 update_interval 决定是否更新跳过层
-                if update_counter % update_interval == 0:
-                    # 提取最后接受 token 的所有层隐藏状态
+                if max_matched - 1<=3:
+                    need_hidden_states +=1
+                else:
+                    need_hidden_states=0
+                # ========== DP 阶段计时 ==========
+                dp_time = 0
+                # if update_counter % update_interval == 0:
+                if  need_hidden_states>=5 and update_counter<3:
+                    update_counter += 1
+                    # print("🔄 触发动态规划跳层优化")
+                    # if(need_hidden_states==0):
+                    #     continue
+                    dp_start = time.perf_counter()
+                    need_hidden_states=0
+                    last_hidden_states = output['hidden_states']
                     last_accepted_hidden = [h[0, max_matched - 1, :] 
                                            for h in last_hidden_states]
                     last_accepted_hidden = torch.stack(last_accepted_hidden, dim=0)
                     
-                    # 动态规划优化跳过层
-                    new_skip_layers = layer_optimizer.optimize_skip_layers(
-                        last_accepted_hidden
+                    torch.cuda.synchronize()
+                    layer_optimizer = DynamicLayerOptimizer(model, num_skip_layers)
+                    new_skip_layers = layer_optimizer.optimize_skip_layers_v2(
+                        last_accepted_hidden,
+                        past_key_values
                     )
+                    torch.cuda.synchronize()
+                    
+                    dp_end = time.perf_counter()
+                    dp_time = (dp_end - dp_start) * 1000  # 转换为毫秒
                     
                     # 更新模型的跳过层配置
+                    # if len(new_skip_layers) != num_skip_layers:
+                    #     print(f"⚠️ DP返回层数 {len(new_skip_layers)} ≠ {num_skip_layers}，强制修正")
+                    #     num_layers = model.config.num_hidden_layers
+                    #     fixed_front = 10
+                    #     fixed_back = 10
+                    #     dynamic_range = list(range(fixed_front, num_layers - fixed_back))
+                    #     step_size = len(dynamic_range) // num_skip_layers
+                    #     new_skip_layers = dynamic_range[::step_size][:num_skip_layers]
+                    
                     model.set_skip_layers(attn_skip_layer_id_set=new_skip_layers, 
                                          mlp_skip_layer_id_set=[])
                     current_skip_layers = new_skip_layers
-                    
-                    # print(f"Updated skip layers: {len(new_skip_layers)} layers")
+                
+                round_timing["dp_time_ms"] = dp_time
+                round_timing["skip_layers"] = current_skip_layers if 'current_skip_layers' in locals() else fixed_skip_layers
+                
+                # 记录本轮时间
+                timing_records["rounds"].append(round_timing)
+                csv_writer.writerow([
+                    round_timing["round"],
+                    round_timing["draft_time_ms"],
+                    round_timing["verify_time_ms"],
+                    round_timing["dp_time_ms"],
+                    round_timing["drafted_tokens"],
+                    round_timing["accepted_tokens"],
+                    len(round_timing["skip_layers"])
+                ])
+                
+                # 打印当前轮次的时间统计
+                # print(f"\n[Round {n_rounds}] Draft: {draft_time:.2f}ms | "
+                #       f"Verify: {verify_time:.2f}ms | DP: {dp_time:.2f}ms | "
+                #       f"Drafted: {drafted_n_tokens} | Accepted: {max_matched-1}")
             
             if early_stop and tokenizer.eos_token_id in output_ids[0].tolist():
                 break
     
+    # 记录总时间
+    end_event.record()
+    torch.cuda.synchronize()
+    total_time = start_event.elapsed_time(end_event)  # 毫秒
+    
     step = min(step, max_new_tokens)
     generate_ids = generate_ids[:, :step]
     full_sequence = torch.cat([input_ids, generate_ids], dim=1)
-    # 计算τ和matchness
+    
+    # 计算统计指标
     tau = (n_matched + n_rounds) / n_rounds if n_rounds > 0 else 1.0
     matchness = n_matched / n_drafted if n_drafted > 0 else 0.0
     
-    print(f"\n{'='*60}")
-    print(f"CLaSp生成完成:")
-    print(f"  总tokens: {step}")
-    print(f"  Draft轮数: {n_rounds}")
-    print(f"  总draft tokens: {n_drafted}")
-    print(f"  总接受tokens: {n_matched}")
-    print(f"  τ (平均接受长度): {tau:.3f}")
-    print(f"  Matchness (接受率): {matchness:.3f}")
-    print(f"{'='*60}\n")
+    # 更新元数据
+    timing_records["metadata"]["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timing_records["metadata"]["total_time_ms"] = total_time
+    timing_records["metadata"]["total_tokens"] = step
+    timing_records["metadata"]["n_rounds"] = n_rounds
+    timing_records["metadata"]["n_drafted"] = n_drafted
+    timing_records["metadata"]["n_matched"] = n_matched
+    timing_records["metadata"]["tau"] = tau
+    timing_records["metadata"]["matchness"] = matchness
     
-    # return {
-    #     'generate_ids': full_sequence,
-    #     'tau': tau,
-    #     'matchness': matchness,
-    #     'num_drafted_tokens': n_drafted,
-    #     'accept_counts': step_accept_counts,
-    #     'num_rounds': n_rounds
-    # }
-
+    # 计算时间统计
+    total_draft_time = sum(r["draft_time_ms"] for r in timing_records["rounds"])
+    total_verify_time = sum(r["verify_time_ms"] for r in timing_records["rounds"])
+    total_dp_time = sum(r["dp_time_ms"] for r in timing_records["rounds"])
+    
+    timing_records["statistics"] = {
+        "total_draft_time_ms": total_draft_time,
+        "total_verify_time_ms": total_verify_time,
+        "total_dp_time_ms": total_dp_time,
+        "avg_draft_time_ms": total_draft_time / len(timing_records["rounds"]) if timing_records["rounds"] else 0,
+        "avg_verify_time_ms": total_verify_time / len(timing_records["rounds"]) if timing_records["rounds"] else 0,
+        "avg_dp_time_ms": total_dp_time / sum(1 for r in timing_records["rounds"] if r["dp_time_ms"] > 0) if any(r["dp_time_ms"] > 0 for r in timing_records["rounds"]) else 0
+    }
+    
+    # 保存JSON文件
+    with open(log_file, 'w') as f:
+        json.dump(timing_records, f, indent=2, ensure_ascii=False)
+    
+    csv_file.close()
+    
+    # 打印总结
+    # print(f"\n{'='*60}")
+    # print(f"CLaSp生成完成:")
+    # print(f"  总tokens: {step}")
+    # print(f"  总时间: {total_time:.2f}ms")
+    # print(f"  Draft轮数: {n_rounds}")
+    # print(f"  总draft tokens: {n_drafted}")
+    # print(f"  总接受tokens: {n_matched}")
+    # print(f"  τ (平均接受长度): {tau:.3f}")
+    # print(f"  Matchness (接受率): {matchness:.3f}")
+    # print(f"\n时间统计:")
+    # print(f"  Draft总时间: {total_draft_time:.2f}ms")
+    # print(f"  Verify总时间: {total_verify_time:.2f}ms")
+    # print(f"  DP总时间: {total_dp_time:.2f}ms")
+    # print(f"  JSON日志保存到: {log_file}")
+    # print(f"  CSV日志保存到: {csv_filename}")
+    # print(f"{'='*60}\n")
+    
     return {
         'generate_ids': full_sequence,
         'matchness': matchness,
         'num_drafted_tokens': n_drafted,
-        'accept_counts': step_accept_counts
+        'accept_counts': step_accept_counts,
+        'timing_records': timing_records,  # 返回时间记录
+        'total_time_ms': total_time
     }
 
 # 添加到映射
 #generate_fn_mapping['clasp'] = clasp_generate
 
+def sample_with_confidence(logits, return_probs=True, do_sample=False, top_k=50, top_p=0.7, temperature=0.7):
+    # 获取原始概率分布（用于计算置信度）
+    original_probs = F.softmax(logits, dim=-1)
+    
+    if do_sample and top_k != 1 and top_p != 0.0 and temperature != 0.0:
+        # 采样模式
+        _logits = top_k_top_p_filtering(
+            logits.view(-1, logits.size(-1)) / temperature, 
+            top_k=top_k, 
+            top_p=top_p
+        )
+        filtered_probs = F.softmax(_logits, dim=-1)
+        output_ids = torch.multinomial(filtered_probs, num_samples=1).view(logits.shape[:-1])
+    else:
+        # 贪婪解码
+        output_ids = torch.argmax(logits, dim=-1)
+    
+    # 获取选中token的原始概率作为置信度
+    if output_ids.dim() == 1:
+        output_ids_expanded = output_ids.unsqueeze(-1)
+    else:
+        output_ids_expanded = output_ids.unsqueeze(-1)
+    
+    confidence = torch.gather(original_probs, -1, output_ids_expanded).squeeze(-1)
+    
+    if return_probs:
+        return output_ids, confidence
+    else:
+        return output_ids
+    
+    
 def sample(logits, return_probs: bool=False, do_sample: bool=False, top_k: int=50, top_p: float=0.7, temperature: float=0.7):
 
     if return_probs:
@@ -314,49 +474,53 @@ def sample(logits, return_probs: bool=False, do_sample: bool=False, top_k: int=5
             
         return output_ids
 
-def base_generate(model, tokenizer, input_ids, max_new_tokens=10, 
-                  do_sample=False, top_k=0, top_p=0.85, temperature=0.2,
+def base_generate(model, tokenizer, input_ids, max_new_tokens=128, 
+                  do_sample=False, top_k=0, top_p=0.85, temperature=0.0,
                   early_stop=False):
 
     current_input_ids = input_ids
-    generate_ids = torch.empty([input_ids.size(0), max_new_tokens], dtype=torch.long, device=model.device)
+    gen_list = []
     past_key_values = None
-    
+
     with torch.no_grad():
-        for step in range(max_new_tokens):
+        for _ in range(max_new_tokens):
             if past_key_values is None:
-                # 第一次调用：处理整个 prompt
                 seq_len = current_input_ids.shape[-1]
                 position_ids = torch.arange(0, seq_len, dtype=torch.long, device=model.device).unsqueeze(0)
             else:
-                # 后续调用：只处理单个 token
                 cache_len = past_key_values[0][0].shape[2]
                 position_ids = torch.tensor([[cache_len]], dtype=torch.long, device=model.device)
-            
+
             output = model(input_ids=current_input_ids,
                            position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    return_dict=True,
-                    use_cache=True)
-            logits = output['logits'][:,-1:]
+                           past_key_values=past_key_values,
+                           return_dict=True,
+                           use_cache=True)
+            logits = output['logits'][:, -1:]
             output_ids = sample(logits, do_sample=do_sample, top_k=top_k, top_p=top_p, temperature=temperature)
-            generate_ids[:, step] = output_ids
+
+            gen_list.append(output_ids)               # collect generated tokens
             current_input_ids = output_ids
             past_key_values = output['past_key_values']
 
             if early_stop and current_input_ids.item() == tokenizer.eos_token_id:
                 break
 
-    step = min(step+1, max_new_tokens)
-    generate_ids = generate_ids[:, :step]
-                
+    if len(gen_list) == 0:
+        gen_ids = torch.empty((input_ids.size(0), 0), dtype=torch.long, device=model.device)
+    else:
+        gen_ids = torch.cat(gen_list, dim=1)  # (batch, n_generated)
+
+    full_sequence = torch.cat([input_ids, gen_ids], dim=1)
     return {
-        'generate_ids': generate_ids,
+        'generate_ids': full_sequence,       # 与 clasp_generate 保持一致
+        'num_new_tokens': gen_ids.size(1),
     }
+
 
 def exact_self_speculative_generate(model, tokenizer, input_ids, max_new_tokens=10, early_stop=False,
                  max_step_draft=8, th_stop_draft=0.8, auto_th_stop_draft=True, auto_parameters=[1,0.5,0.9,1e-2,0.9],
-                 do_sample=False, do_sample_draft=False, top_k=0, top_p=0.85, temperature=0.2):
+                 do_sample=False, do_sample_draft=False, top_k=0, top_p=0.85, temperature=0.0):
     
     step = 0
     step_draft = 0
@@ -482,11 +646,11 @@ def max_fn(x, eps=1e-6):
     x_max = torch.where(x > 0, x, 0)
     return x_max / (torch.sum(x_max) + eps)
 
-def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=10, early_stop=False,
+def self_speculative_sample(model, tokenizer, input_ids, max_new_tokens=128, early_stop=False,
                  max_step_draft=8, th_stop_draft=0.5, th_random_draft=1.0, auto_th_stop_draft=True, 
                  auto_parameters=[1,0.5,0.9,1e-2,0.9],
                  do_sample=False, do_sample_draft=False, 
-                 top_k=0, top_p=0.85, temperature=0.2):
+                 top_k=0, top_p=0.85, temperature=0.0):
     
     step = 0
     step_draft = 0

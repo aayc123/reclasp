@@ -59,9 +59,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 # _attn_skip_layer_id_set = [3, 5, 6, 8, 10, 11, 14, 15, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37]
 # _mlp_skip_layer_id_set = [6, 9, 10, 11, 15, 24, 25, 27, 28, 35]
 
-_attn_skip_layer_id_set = [ 14, 15, 16]
+_attn_skip_layer_id_set = [ 10, 11, 13, 14, 16, 17, 19, 21] 
 _mlp_skip_layer_id_set = [15]
-print('(Re-)Loading modeling...')
+# _attn_skip_layer_id_set = [3, 5, 6, 8, 11, 14, 18, 22, 24, 25, 26, 27, 28, 29, 30]
+# _mlp_skip_layer_id_set = [6, 9, 10, 11, 24, 25, 27, 28]
+# print('(Re-)Loading modeling...')
 
 
 class LlamaAttention(_LlamaAttention):
@@ -124,11 +126,7 @@ class LlamaAttention(_LlamaAttention):
         kv_seq_len = q_len
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[2]
-        
-        # 🔍 添加调试信息（仅在第一层打印，避免刷屏）
-        # if self.layer_idx == 0:
-        #     print(f"    [Layer 0 Attn] q_len={q_len}, kv_seq_len={kv_seq_len}, past_kv={'Yes' if past_key_value else 'No'}")
-        
+    
         # 生成 position_ids
         if position_ids is None:
             if past_key_value is None:
@@ -142,10 +140,7 @@ class LlamaAttention(_LlamaAttention):
                     dtype=torch.long, device=query_states.device
                 ).unsqueeze(0)
             
-            # 🔍 如果自动生成了 position_ids，打印警告
-            if self.layer_idx == 0:
-                print(f"    [Layer 0 Attn] ⚠️ Auto-generated position_ids: {position_ids}")
-                
+               
         # 修复后的代码
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         cos = cos.to(dtype=hidden_states.dtype)
@@ -232,6 +227,7 @@ class LlamaDecoderLayer(nn.Module):
         draft_mlp_skip_mask: torch.Tensor = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        draft_mode: bool = False, 
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -278,11 +274,18 @@ class LlamaDecoderLayer(nn.Module):
         else:
             
             residual = hidden_states
-
+            # if self.layer_id < 3 or self.layer_id in [10, 11, 13, 14, 16]:
+            #     print(f"  🔍 Layer {self.layer_id}: enabled_draft={enabled_draft}, in_skip_set={self.layer_id in _attn_skip_layer_id_set}")
+            
             if enabled_draft and self.layer_id in _attn_skip_layer_id_set:
+                # if self.layer_id in [10, 11, 13, 14]:  # 只打印部分层避免刷屏
+                #     print(f"    ⚡⚡⚡ SKIPPING Attn Layer {self.layer_id} ⚡⚡⚡")
                 hidden_states = residual
                 present_key_value = None
             else:
+                # if self.layer_id < 3:
+                #     print(f"    ✅ Executing Attn Layer {self.layer_id} (Normal)")
+                
                 hidden_states = self.input_layernorm(hidden_states)
     
                 # Self Attention
@@ -301,6 +304,8 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
             
             if enabled_draft and self.layer_id in _mlp_skip_layer_id_set:
+                # if self.layer_id in [15]:
+                #     print(f"    ⚡⚡⚡ SKIPPING MLP Layer {self.layer_id} ⚡⚡⚡")
                 hidden_states = residual
             else:
                 hidden_states = self.post_attention_layernorm(hidden_states)
